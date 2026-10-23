@@ -387,8 +387,12 @@ const b64 = (n: number): string => Buffer.from(big(n)).toString("base64");
   // Edge cases: root-parented state entry, cycle guard, compaction fallback, label targetId
   const rootState: EntryLike = { type: "custom", customType: "pi-shake", id: "sr", parentId: null };
   const childOfRootState: EntryLike = { type: "message", id: "m1", parentId: "sr", message: { role: "user", content: "hi" } };
-  const rootSpliced = spliceOutStateEntries([header, rootState, childOfRootState], "m1");
+  const labelOnRootState: EntryLike = { type: "label", id: "lr", parentId: "m1", targetId: "sr", label: "orphan" };
+  const afterRootLabel: EntryLike = { type: "message", id: "m2", parentId: "lr", message: { role: "assistant", content: [{ type: "text", text: "ok" }] } };
+  const rootSpliced = spliceOutStateEntries([header, rootState, childOfRootState, labelOnRootState, afterRootLabel], "lr");
   check("child of root-parented state entry becomes root (parentId null)", rootSpliced.byId.get("m1")?.parentId === null);
+  check("label targeting root-parented state entry is dropped and its child m2 reparents to m1", !rootSpliced.byId.has("lr") && rootSpliced.byId.get("m2")?.parentId === "m1");
+  check("currentLeafId on dropped root-state label resolves realLeaf to m1", rootSpliced.realLeaf?.id === "m1");
 
   const cyc1: EntryLike = { type: "custom", customType: "pi-shake", id: "cyc1", parentId: "cyc2" };
   const cyc2: EntryLike = { type: "custom", customType: "pi-shake", id: "cyc2", parentId: "cyc1" };

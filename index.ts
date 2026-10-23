@@ -496,12 +496,12 @@ export function spliceOutStateEntries(
 ): { entries: EntryLike[]; byId: Map<string, EntryLike>; realLeaf: EntryLike | undefined } {
   const isStateEntry = (e: EntryLike): boolean => e.type === "custom" && e.customType === STATE_TYPE;
   const entryById = new Map<string, EntryLike>();
-  const stateParentById = new Map<string, string | null>();
+  const removedParentById = new Map<string, string | null>();
   for (const e of entries) {
     if (e.type !== "session" && typeof e.id === "string") {
       entryById.set(e.id, e);
       if (isStateEntry(e)) {
-        stateParentById.set(e.id, typeof e.parentId === "string" ? e.parentId : null);
+        removedParentById.set(e.id, typeof e.parentId === "string" ? e.parentId : null);
       }
     }
   }
@@ -509,18 +509,40 @@ export function spliceOutStateEntries(
   const resolveUp = (id: string | null | undefined): string | null => {
     let cur = typeof id === "string" ? id : null;
     const seen = new Set<string>();
-    while (typeof cur === "string" && stateParentById.has(cur)) {
+    while (typeof cur === "string" && removedParentById.has(cur)) {
       if (seen.has(cur)) return null;
       seen.add(cur);
-      cur = stateParentById.get(cur) ?? null;
+      cur = removedParentById.get(cur) ?? null;
     }
     return cur;
   };
 
+  // A label whose targetId resolves to null (e.g. targeting a root-parented
+  // state entry) cannot point at anything valid and must also be dropped.
+  // Register it in removedParentById up front so children/compactions/leaf
+  // pointers that reference the dropped label are spliced across it too.
+  let addedRemovedLabel = true;
+  while (addedRemovedLabel) {
+    addedRemovedLabel = false;
+    for (const e of entries) {
+      if (
+        e.type === "label" &&
+        typeof e.id === "string" &&
+        !removedParentById.has(e.id) &&
+        typeof e.targetId === "string" &&
+        removedParentById.has(e.targetId) &&
+        resolveUp(e.targetId) === null
+      ) {
+        removedParentById.set(e.id, typeof e.parentId === "string" ? e.parentId : null);
+        addedRemovedLabel = true;
+      }
+    }
+  }
+
   // When prepareCompaction cuts right after a pi-shake state entry, Pi backs
   // cutIndex over zero-message entries and sets compaction.firstKeptEntryId to
   // that state entry's id. Advance it along the compaction's ancestor path to
-  // the first non-state kept entry so buildContextEntries() still finds it.
+  // the first non-removed kept entry so buildContextEntries() still finds it.
   const resolveFirstKeptId = (compEntry: EntryLike): string => {
     const rawFirst = compEntry.firstKeptEntryId as string;
     const chain: EntryLike[] = [];
@@ -535,7 +557,7 @@ export function spliceOutStateEntries(
     let passedTarget = false;
     for (const node of chain) {
       if (node.id === rawFirst) passedTarget = true;
-      if (passedTarget && !isStateEntry(node) && typeof node.id === "string") {
+      if (passedTarget && typeof node.id === "string" && !removedParentById.has(node.id)) {
         return node.id;
       }
     }
@@ -544,18 +566,18 @@ export function spliceOutStateEntries(
 
   const withoutState: EntryLike[] = [];
   for (const e of entries) {
-    if (isStateEntry(e)) continue;
+    if (isStateEntry(e) || (typeof e.id === "string" && removedParentById.has(e.id))) continue;
     let next = e;
-    if (typeof e.parentId === "string" && stateParentById.has(e.parentId)) {
+    if (typeof e.parentId === "string" && removedParentById.has(e.parentId)) {
       next = { ...next, parentId: resolveUp(e.parentId) };
     }
-    if (e.type === "compaction" && typeof e.firstKeptEntryId === "string" && stateParentById.has(e.firstKeptEntryId)) {
+    if (e.type === "compaction" && typeof e.firstKeptEntryId === "string" && removedParentById.has(e.firstKeptEntryId)) {
       next = { ...next, firstKeptEntryId: resolveFirstKeptId(e) };
     }
-    if (e.type === "branch_summary" && typeof e.fromId === "string" && stateParentById.has(e.fromId)) {
+    if (e.type === "branch_summary" && typeof e.fromId === "string" && removedParentById.has(e.fromId)) {
       next = { ...next, fromId: resolveUp(e.fromId) ?? "root" };
     }
-    if (e.type === "label" && typeof e.targetId === "string" && stateParentById.has(e.targetId)) {
+    if (e.type === "label" && typeof e.targetId === "string" && removedParentById.has(e.targetId)) {
       const targetId = resolveUp(e.targetId);
       if (!targetId) continue;
       next = { ...next, targetId };
