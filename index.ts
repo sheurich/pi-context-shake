@@ -485,6 +485,102 @@ export function rebuildEntries(
 }
 
 /**
+ * Remove existing `pi-shake` custom state entries while splicing them out of
+ * the entry graph so entries appended after an earlier `/shake` stay connected
+ * to their pre-shake ancestors (`parentId`, `compaction.firstKeptEntryId`, and
+ * `branch_summary.fromId`). Also resolves the active branch's real leaf entry.
+ */
+export function spliceOutStateEntries(
+  entries: EntryLike[],
+  currentLeafId?: string | null,
+): { entries: EntryLike[]; byId: Map<string, EntryLike>; realLeaf: EntryLike | undefined } {
+  const isStateEntry = (e: EntryLike): boolean => e.type === "custom" && e.customType === STATE_TYPE;
+  const entryById = new Map<string, EntryLike>();
+  const stateParentById = new Map<string, string | null>();
+  for (const e of entries) {
+    if (e.type !== "session" && typeof e.id === "string") {
+      entryById.set(e.id, e);
+      if (isStateEntry(e)) {
+        stateParentById.set(e.id, typeof e.parentId === "string" ? e.parentId : null);
+      }
+    }
+  }
+
+  const resolveUp = (id: string | null | undefined): string | null => {
+    let cur = typeof id === "string" ? id : null;
+    const seen = new Set<string>();
+    while (typeof cur === "string" && stateParentById.has(cur)) {
+      if (seen.has(cur)) return null;
+      seen.add(cur);
+      cur = stateParentById.get(cur) ?? null;
+    }
+    return cur;
+  };
+
+  // When prepareCompaction cuts right after a pi-shake state entry, Pi backs
+  // cutIndex over zero-message entries and sets compaction.firstKeptEntryId to
+  // that state entry's id. Advance it along the compaction's ancestor path to
+  // the first non-state kept entry so buildContextEntries() still finds it.
+  const resolveFirstKeptId = (compEntry: EntryLike): string => {
+    const rawFirst = compEntry.firstKeptEntryId as string;
+    const chain: EntryLike[] = [];
+    let cur: EntryLike | undefined = compEntry;
+    const seen = new Set<string>();
+    while (cur && typeof cur.id === "string" && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      chain.push(cur);
+      cur = typeof cur.parentId === "string" ? entryById.get(cur.parentId) : undefined;
+    }
+    chain.reverse();
+    let passedTarget = false;
+    for (const node of chain) {
+      if (node.id === rawFirst) passedTarget = true;
+      if (passedTarget && !isStateEntry(node) && typeof node.id === "string") {
+        return node.id;
+      }
+    }
+    return typeof compEntry.id === "string" ? compEntry.id : rawFirst;
+  };
+
+  const withoutState: EntryLike[] = [];
+  for (const e of entries) {
+    if (isStateEntry(e)) continue;
+    let next = e;
+    if (typeof e.parentId === "string" && stateParentById.has(e.parentId)) {
+      next = { ...next, parentId: resolveUp(e.parentId) };
+    }
+    if (e.type === "compaction" && typeof e.firstKeptEntryId === "string" && stateParentById.has(e.firstKeptEntryId)) {
+      next = { ...next, firstKeptEntryId: resolveFirstKeptId(e) };
+    }
+    if (e.type === "branch_summary" && typeof e.fromId === "string" && stateParentById.has(e.fromId)) {
+      next = { ...next, fromId: resolveUp(e.fromId) ?? "root" };
+    }
+    if (e.type === "label" && typeof e.targetId === "string" && stateParentById.has(e.targetId)) {
+      const targetId = resolveUp(e.targetId);
+      if (!targetId) continue;
+      next = { ...next, targetId };
+    }
+    withoutState.push(next);
+  }
+
+  const byId = new Map<string, EntryLike>();
+  for (const e of withoutState) {
+    if (e.type !== "session" && typeof e.id === "string") byId.set(e.id, e);
+  }
+  const resolvedLeafId = resolveUp(currentLeafId);
+  let realLeaf: EntryLike | undefined = typeof resolvedLeafId === "string" ? byId.get(resolvedLeafId) : undefined;
+  if (!realLeaf) {
+    const hasParent = new Set<string>();
+    for (const e of withoutState) if (typeof e.parentId === "string") hasParent.add(e.parentId);
+    for (const e of withoutState) {
+      if (e.type !== "session" && typeof e.id === "string" && !hasParent.has(e.id)) realLeaf = e;
+    }
+  }
+
+  return { entries: withoutState, byId, realLeaf };
+}
+
+/**
  * Signed thinking blocks (Anthropic) must normally be replayed verbatim in
  * multi-turn requests. Dropping them is only safe when the active model is
  * not anthropic-messages, or when pi sends the thinking-binding-controls
@@ -677,20 +773,12 @@ export default function (pi: ExtensionAPI) {
     };
 
     // Normalize state: exactly one pi-shake entry, chained onto the current leaf.
-    const withoutState = rebuilt.filter((e) => !(e.type === "custom" && e.customType === STATE_TYPE));
-    // Index the real (non-state) entries and find their leaf — the last
-    // entry that is not a parent of any other. The new state entry chains
-    // onto this real leaf (never onto an old state entry, which is filtered
-    // out of the file), so the branch stays connected and pi's projection
-    // is not left empty on a re-shake.
-    const byId = new Map<string, EntryLike>();
-    for (const e of withoutState) if (typeof e.id === "string") byId.set(e.id, e);
-    const hasParent = new Set<string>();
-    for (const e of withoutState) if (typeof e.parentId === "string") hasParent.add(e.parentId);
-    let realLeaf: EntryLike | undefined;
-    for (const e of withoutState) {
-      if (typeof e.id === "string" && !hasParent.has(e.id)) realLeaf = e;
-    }
+    // Splice old pi-shake state entries out of parentId / compaction pointers
+    // so entries appended after an earlier shake stay connected to pre-shake history.
+    const { entries: withoutState, byId, realLeaf } = spliceOutStateEntries(
+      rebuilt,
+      ctx.sessionManager.getLeafId(),
+    );
     const usedIds = new Set<string>();
     for (const e of withoutState) if (typeof e.id === "string") usedIds.add(e.id);
     let stateId = "";
